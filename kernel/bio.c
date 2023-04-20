@@ -23,14 +23,28 @@
 #include "fs.h"
 #include "buf.h"
 
+#define NBUCKETS 13
+
 struct {
-  struct spinlock lock;
+  // struct spinlock lock;
   struct buf buf[NBUF];
 
-  // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
-  struct buf head;
+  struct {
+    struct spinlock lock;
+    struct buf head;
+  } buckets[NBUCKETS];
+
+  // unused buf list
+  struct {
+    struct spinlock lock;
+    struct buf head;
+  } unused;
+  
+
+  // // Linked list of all buffers, through prev/next.
+  // // Sorted by how recently the buffer was used.
+  // // head.next is most recent, head.prev is least.
+  // struct buf head;
 } bcache;
 
 void
@@ -38,18 +52,37 @@ binit(void)
 {
   struct buf *b;
 
-  initlock(&bcache.lock, "bcache");
+  initlock(&bcache.unused.lock, "unusedbuf");
 
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+  for (int i = 0; i < NBUCKETS; i++) {
+    initlock(&bcache.buckets[i].lock, "bcache bucket");
+
+    bcache.buckets[i].head.prev = &bcache.buckets[i].head;
+    bcache.buckets[i].head.next = &bcache.buckets[i].head;
+
   }
+
+  // create linked list of buffers
+  bcache.unused.head.prev = &bcache.unused.head;
+  bcache.unused.head.next = &bcache.unused.head;
+  for(b = bcache.buf; b < bcache.buf+NBUF; b++) {
+    b->next = bcache.unused.head.next;
+    b->prev = &bcache.unused.head;
+    initsleeplock(&b->lock, "buffer");
+    bcache.unused.head.next->prev = b;
+    bcache.unused.head.next = b;
+  }
+
+  // // Create linked list of buffers
+  // bcache.head.prev = &bcache.head;
+  // bcache.head.next = &bcache.head;
+  // for(b = bcache.buf; b < bcache.buf+NBUF; b++){
+  //   b->next = bcache.head.next;
+  //   b->prev = &bcache.head;
+  //   initsleeplock(&b->lock, "buffer");
+  //   bcache.head.next->prev = b;
+  //   bcache.head.next = b;
+  // }
 }
 
 // Look through buffer cache for block on device dev.
@@ -60,31 +93,70 @@ bget(uint dev, uint blockno)
 {
   struct buf *b;
 
-  acquire(&bcache.lock);
+  int hash_index = blockno % NBUCKETS;
 
-  // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
+  acquire(&bcache.buckets[hash_index].lock);
+
+  // is the block already cached?
+  for(b = bcache.buckets[hash_index].head.next; b != &bcache.buckets[hash_index].head; b = b->next) {
+    if(b->dev == dev && b->blockno == blockno) {
       b->refcnt++;
-      release(&bcache.lock);
+      release(&bcache.buckets[hash_index].lock);
       acquiresleep(&b->lock);
       return b;
     }
   }
 
-  // Not cached.
-  // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
-  }
+  // not cached
+  acquire(&bcache.unused.lock);
+  b = bcache.unused.head.next;
+  if(b) {
+    if(b->refcnt != 0) panic("refcnt not zero");
+
+    bcache.unused.head.next = b->next;
+    b->next->prev = &bcache.unused.head;
+
+    b->next = bcache.buckets[hash_index].head.next;
+    b->next->prev = b;
+    bcache.buckets[hash_index].head.next = b;
+    b->prev = &bcache.buckets[hash_index].head;
+
+    b->dev = dev;
+    b->blockno = blockno;
+    b->valid = 0;
+    b->refcnt = 1;
+    release(&bcache.buckets[hash_index].lock);
+    release(&bcache.unused.lock);
+    acquiresleep(&b->lock);
+    return b;
+
+  } 
+
+  // acquire(&bcache.lock);
+
+  // // Is the block already cached?
+  // for(b = bcache.head.next; b != &bcache.head; b = b->next){
+  //   if(b->dev == dev && b->blockno == blockno){
+  //     b->refcnt++;
+  //     release(&bcache.lock);
+  //     acquiresleep(&b->lock);
+  //     return b;
+  //   }
+  // }
+
+  // // Not cached.
+  // // Recycle the least recently used (LRU) unused buffer.
+  // for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
+  //   if(b->refcnt == 0) {
+  //     b->dev = dev;
+  //     b->blockno = blockno;
+  //     b->valid = 0;
+  //     b->refcnt = 1;
+  //     release(&bcache.lock);
+  //     acquiresleep(&b->lock);
+  //     return b;
+  //   }
+  // }
   panic("bget: no buffers");
 }
 
@@ -121,33 +193,49 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  // acquire(&bcache.lock);
+  int hash_index = b->blockno % NBUCKETS;
+  acquire(&bcache.buckets[hash_index].lock);
   b->refcnt--;
   if (b->refcnt == 0) {
-    // no one is waiting for it.
+    acquire(&bcache.unused.lock);
+
     b->next->prev = b->prev;
     b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+
+    b->next = bcache.unused.head.next;
+    b->prev = &bcache.unused.head;
+    bcache.unused.head.next->prev = b;
+    bcache.unused.head.next = b;
+
+    // // no one is waiting for it.
+    // b->next->prev = b->prev;
+    // b->prev->next = b->next;
+    // b->next = bcache.head.next;
+    // b->prev = &bcache.head;
+    // bcache.head.next->prev = b;
+    // bcache.head.next = b;
+    release(&bcache.unused.lock);
   }
-  
-  release(&bcache.lock);
+
+  release(&bcache.buckets[hash_index].lock);
+  // release(&bcache.lock);
 }
 
 void
 bpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int hash_index = b->blockno % NBUCKETS;
+  acquire(&bcache.buckets[hash_index].lock);
   b->refcnt++;
-  release(&bcache.lock);
+  release(&bcache.buckets[hash_index].lock);
 }
 
 void
 bunpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int hash_index = b->blockno % NBUCKETS;
+  acquire(&bcache.buckets[hash_index].lock);
   b->refcnt--;
-  release(&bcache.lock);
+  release(&bcache.buckets[hash_index].lock);
 }
 
 
